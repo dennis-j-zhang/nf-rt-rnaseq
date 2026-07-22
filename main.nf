@@ -17,7 +17,15 @@ nextflow.enable.dsl = 2
 
 process RUN_ACCESSION {
     tag "${sra}"
-    publishDir "${params.output_path}/${params.project}", mode: 'copy', overwrite: true
+    // Publish ONLY the minimal artifact set (allow-list) — drops the regenerable/heavy scratch
+    // (bt2 index, mapped.bam, reference.fasta, features.json, aligner_comparison.json, md.bam) from S3.
+    publishDir "${params.output_path}/${params.project}", mode: 'copy', overwrite: true,
+        saveAs: { f ->
+            def b = f.tokenize('/').last()
+            (b in ['regions.bed', 'genes.tsv', 'depth.tsv.gz', 'coverage_summary.json',
+                   'state.json', 'run.log', 'flagstat.tsv', 'idxstats.tsv']
+             || b.startsWith('igr_scores.') || b.startsWith('run_summary.')) ? f : null
+        }
 
     input:
     tuple val(sra), path(loci)
@@ -35,6 +43,7 @@ process RUN_ACCESSION {
     export RT_ATLAS_ERDA_BASE=\$(aws secretsmanager get-secret-value --secret-id ${params.erda_secret_id} --query SecretString --output text)
     export FDZ004_SHORT_ALIGNERS='${params.short_aligner}' FDZ004_THREADS=${task.cpus} FDZ004_MAX_SRA_GB=${params.max_sra_gb}
     export FDZ004_IGR_MIN=${params.igr_min} FDZ004_IGR_MAX=${params.igr_max} FDZ004_CLEANUP=1
+    export FDZ004_MINIMAL=1   # depth over the RT-neighborhood window only; skip calmd/features/aligner-comparison
 
     # steps 1-6: fetch_sra -> extract_fastq -> build_reference -> map (bowtie2 short / minimap2 long) -> postprocess -> coverage
     # cleanup frees .sra + FASTQ + raw sorted BAM after coverage; keeps reference/ + coverage/ (the light outputs)

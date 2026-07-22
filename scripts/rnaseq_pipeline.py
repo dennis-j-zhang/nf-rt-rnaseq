@@ -59,6 +59,7 @@ class Config:
     short_aligners: tuple = ("bowtie2",)    # coverage arm (short reads); verdict = bowtie2. benchmark: bwa-mem2,bowtie2,minimap2-sr,minibwa
     min_aln_frac: float = 0.0               # coverage filter OFF by default (transcriptomic, aligner-invariant); metaT: ~0.90
     min_mapq: int = 0                       # coverage filter OFF by default; metaT specificity: ~20 (drops multimappers)
+    minimal: bool = False                   # deployment/scale-up: depth over the RT-neighborhood window only; skip the unused calmd/features/aligner-comparison artifacts
 
     @staticmethod
     def from_env(work_dir: Path, out_dir: Path) -> "Config":
@@ -79,6 +80,7 @@ class Config:
             short_aligners=tuple(a.strip() for a in os.environ.get("FDZ004_SHORT_ALIGNERS", "bowtie2").split(",") if a.strip()),
             min_aln_frac=float(os.environ.get("FDZ004_MIN_ALN_FRAC", 0.0)),
             min_mapq=int(os.environ.get("FDZ004_MIN_MAPQ", 0)),
+            minimal=os.environ.get("FDZ004_MINIMAL", "0") not in ("0", "false", "False", ""),
         )
 
 
@@ -562,18 +564,28 @@ def _filter_for_coverage(bam: Path, out_bam: Path, min_aln_frac: float, min_mapq
 def coverage(cfg: Config, postresult: dict, ref_manifest: dict, regions_bed: Path,
              ref_fasta: Path, dest: Path, log_path: Path) -> dict:
     """Per-aligner: depth quantification (enriched IGRs) + RT-biology feature extraction
-    (clip/split/mismatch/indel/multimap via features.py) + a per-RT aligner comparison."""
-    import features as feat
+    (clip/split/mismatch/indel/multimap via features.py) + a per-RT aligner comparison.
+    In minimal mode (cfg.minimal, for the scale-up deployment): depth is restricted to the padded
+    RT-neighborhood window (smaller depth.tsv.gz, less RAM; scores unchanged — see _write_depth_window),
+    and the metric-irrelevant calmd/features/aligner-comparison artifacts are skipped."""
     regions = _load_regions(regions_bed)
     out: dict = {}
+    region_arg = ""
+    if cfg.minimal:
+        dest.mkdir(parents=True, exist_ok=True)
+        contig_lens = {c: int(n) for c, n in (ref_manifest.get("contigs") or {}).items()}
+        window_bed = dest / "depth_window.bed"
+        _write_depth_window(regions, contig_lens, DEPTH_WINDOW_MARGIN_BP, window_bed)
+        region_arg = f"-b {window_bed} "
     for aligner, pr in postresult.items():
         adest = dest / aligner
         adest.mkdir(parents=True, exist_ok=True)
         bam = Path(pr["mapped_bam"])
-        # MD-tagged BAM so features.py can call mismatches (A→N for DGR)
+        # MD-tagged BAM so features.py can call mismatches (A→N for DGR) — features unused in minimal mode
         md_bam = adest / "mapped.md.bam"
-        _run(["bash", "-c", f"samtools calmd -b {bam} {ref_fasta} > {md_bam} 2>/dev/null"], log_path=log_path)
-        _run(["samtools", "index", str(md_bam)], log_path=log_path)
+        if not cfg.minimal:
+            _run(["bash", "-c", f"samtools calmd -b {bam} {ref_fasta} > {md_bam} 2>/dev/null"], log_path=log_path)
+            _run(["samtools", "index", str(md_bam)], log_path=log_path)
         # depth quantification (enriched IGR calls) — COVERAGE-SPECIFICITY pre-filter first:
         # keep only reads with MAPQ >= min_mapq AND aligned-fraction >= min_aln_frac (trim-free
         # metatranscriptomic specificity). Structural analysis below uses the UNfiltered md_bam.
@@ -583,11 +595,11 @@ def coverage(cfg: Config, postresult: dict, ref_manifest: dict, regions_bed: Pat
         # short-read aligned-fraction cut would drop ~half of them. Short reads: full AF+MAPQ filter.
         af = 0.0 if aligner == "minimap2" else cfg.min_aln_frac
         if af <= 0 and cfg.min_mapq <= 0:   # out-of-the-box: no coverage filter — count ALL primary mapped reads
-            _run(["bash", "-c", f"samtools depth -a -G 0x900 {bam} > {depth_tsv}"], log_path=log_path)  # -G: drop secondary+supplementary
+            _run(["bash", "-c", f"samtools depth -a -G 0x900 {region_arg}{bam} > {depth_tsv}"], log_path=log_path)  # -G: drop secondary+supplementary
             kept = tot = None
         else:
             kept, tot = _filter_for_coverage(bam, filt_bam, af, cfg.min_mapq)
-            _run(["bash", "-c", f"samtools depth -a {filt_bam} > {depth_tsv}"], log_path=log_path)
+            _run(["bash", "-c", f"samtools depth -a {region_arg}{filt_bam} > {depth_tsv}"], log_path=log_path)
         depth = _read_depth(depth_tsv)
         summary = _quantify(regions, depth)
         summary["coverage_filter"] = {"min_aln_frac": af, "min_mapq": cfg.min_mapq,
@@ -595,16 +607,19 @@ def coverage(cfg: Config, postresult: dict, ref_manifest: dict, regions_bed: Pat
         (adest / "coverage_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
         # feature extraction (clip/split/mismatch/indel/multimap) — JSON only, NO default PNG (the custom
         # 2-profile viz renders separately). md_bam is UNfiltered so structural reads are preserved.
-        try:
-            summary["features"] = feat.analyze(str(md_bam), str(ref_fasta), regions,
-                                               adest / "features.json", None)
-        except Exception as exc:
-            summary["features_error"] = repr(exc)
+        if not cfg.minimal:
+            import features as feat
+            try:
+                summary["features"] = feat.analyze(str(md_bam), str(ref_fasta), regions,
+                                                   adest / "features.json", None)
+            except Exception as exc:
+                summary["features_error"] = repr(exc)
         _run(["bash", "-c", f"gzip -f {depth_tsv}"], log_path=log_path)
         filt_bam.unlink(missing_ok=True)   # coverage filter is an intermediate; depth.tsv.gz is the artifact
         out[aligner] = summary
-    out["_comparison"] = _compare_aligners(out, regions, postresult)
-    (dest / "aligner_comparison.json").write_text(json.dumps(out["_comparison"], indent=2) + "\n")
+    if not cfg.minimal:   # single-aligner deployment has nothing to compare
+        out["_comparison"] = _compare_aligners(out, regions, postresult)
+        (dest / "aligner_comparison.json").write_text(json.dumps(out["_comparison"], indent=2) + "\n")
     return out
 
 
@@ -653,6 +668,32 @@ def _compare_aligners(out: dict, regions: list[dict], postresult: dict | None = 
                 },
             }
     return cmp
+
+
+DEPTH_WINDOW_MARGIN_BP = 200   # minimal mode: pad the per-contig RT-neighborhood depth window. Wide enough that
+                               # every scored RT/IGR base is inside it, so quantified depths equal whole-contig.
+
+
+def _write_depth_window(regions: list[dict], contig_lens: dict[str, int], margin: int, out_path: Path) -> None:
+    """One BED interval per contig spanning all its RT/IGR regions, padded by `margin` and clamped to the
+    contig length. `samtools depth -b` over this shrinks depth.tsv from whole-contig to the neighborhood;
+    _region_depths() defaults uncovered positions to 0 and the margin keeps every scored base covered, so
+    the quantified per-region depths are identical to the whole-contig computation."""
+    span: dict[str, list[int]] = {}
+    for r in regions:
+        if r["contig"] in span:
+            span[r["contig"]][0] = min(span[r["contig"]][0], r["start"])
+            span[r["contig"]][1] = max(span[r["contig"]][1], r["end"])
+        else:
+            span[r["contig"]] = [r["start"], r["end"]]
+    lines = []
+    for c, (lo, hi) in sorted(span.items()):
+        s = max(0, lo - margin)
+        e = hi + margin
+        if c in contig_lens:
+            e = min(e, contig_lens[c])
+        lines.append(f"{c}\t{s}\t{e}")
+    out_path.write_text("\n".join(lines) + "\n")
 
 
 def _load_regions(bed: Path) -> list[dict]:
@@ -842,11 +883,12 @@ def main() -> None:
     results = {}
     for sra, loci in by_sra.items():
         results[sra] = run_accession(cfg, sra, loci, con)
-    # roll up a run-level summary
-    summary = {sra: {"complete": st.get("complete", False), "skipped": st.get("skipped", False)}
-               for sra, st in results.items()}
-    (out / "run_summary.json").write_text(json.dumps(summary, indent=2, default=str) + "\n")
-    log(f"\n[DONE] summary -> {out/'run_summary.json'}")
+    # per-accession run summary — one file per SRA (NOT a single run_summary.json), so parallel Batch
+    # tasks publishing to the same S3 dir never collide/overwrite each other.
+    for sra, st in results.items():
+        rec = {sra: {"complete": st.get("complete", False), "skipped": st.get("skipped", False)}}
+        (out / f"run_summary.{sra}.json").write_text(json.dumps(rec, indent=2, default=str) + "\n")
+    log(f"\n[DONE] {len(results)} summary file(s) -> {out}/run_summary.<sra>.json")
 
 
 if __name__ == "__main__":
