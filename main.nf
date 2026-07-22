@@ -29,8 +29,10 @@ process RUN_ACCESSION {
     """
     set -euo pipefail
 
-    # ERDA atlas bearer URL from Secrets Manager (TASK role needs secretsmanager:GetSecretValue on ${params.erda_secret_id})
-    export RT_ATLAS_ERDA_BASE=\$(aws secretsmanager get-secret-value --secret-id ${params.erda_secret_id} --region ${params.aws_region} --query SecretString --output text)
+    # region for ALL aws calls in this task (per Xiandong; matches nf-basespace bin/aws_secretsmanager*.sh) — also fixes the SRA aws-s3 pull
+    export AWS_DEFAULT_REGION=${params.aws_region}
+    # ERDA atlas bearer URL from Secrets Manager — plain-string secret, read directly (no jq); \$() strips the trailing newline
+    export RT_ATLAS_ERDA_BASE=\$(aws secretsmanager get-secret-value --secret-id ${params.erda_secret_id} --query SecretString --output text)
     export FDZ004_SHORT_ALIGNERS='${params.short_aligner}' FDZ004_THREADS=${task.cpus} FDZ004_MAX_SRA_GB=${params.max_sra_gb}
     export FDZ004_IGR_MIN=${params.igr_min} FDZ004_IGR_MAX=${params.igr_max} FDZ004_CLEANUP=1
 
