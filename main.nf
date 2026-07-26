@@ -62,3 +62,29 @@ workflow {
         .map { row -> tuple(row.sra_accession, file(row.loci)) }
         | RUN_ACCESSION
 }
+
+// Hands-off phone ping when the whole sweep finishes (success OR failure), fired from the Batch HEAD so the
+// Mac can be closed. Topic comes from the NTFY_TOPIC env injected at submit (NOT committed — the head job
+// role can't read Secrets Manager, so we pass it as a job env var). Pure-JDK POST, so no curl dependency;
+// wrapped so a notify failure never affects the run. Unset NTFY_TOPIC => silently skipped.
+workflow.onComplete {
+    def topic = System.getenv('NTFY_TOPIC')
+    if( !topic ) { log.info "ntfy: NTFY_TOPIC unset — no push sent"; return }
+    try {
+        def server = System.getenv('NTFY_SERVER') ?: 'https://ntfy.sh'
+        def ok = workflow.success
+        def st = workflow.stats
+        def body = (ok ? "✅ DONE" : "❌ FAILED") +
+                   " — rt-rnaseq ${params.project}: ${st.succeededCount} ok / ${st.failedCount} failed (${workflow.duration})"
+        def conn = new URL("${server}/${topic}").openConnection()
+        conn.setRequestMethod('POST'); conn.setDoOutput(true)
+        conn.setConnectTimeout(15000); conn.setReadTimeout(15000)
+        conn.setRequestProperty('Title', "rt-rnaseq ${params.project}")
+        conn.setRequestProperty('Priority', ok ? 'default' : 'urgent')
+        conn.setRequestProperty('Tags', ok ? 'white_check_mark' : 'rotating_light')
+        conn.outputStream.withWriter('UTF-8') { it << body }
+        log.info "ntfy: pushed (${conn.responseCode}) -> ${server}/${topic}"
+    } catch( Exception e ) {
+        log.warn "ntfy notify failed: ${e.message}"
+    }
+}
