@@ -75,7 +75,7 @@ workflow.onComplete {
         def ok = workflow.success
         def st = workflow.stats
         def body = (ok ? "✅ DONE" : "❌ FAILED") +
-                   " — rt-rnaseq ${params.project}: ${st.succeededCount} ok / ${st.failedCount} failed (${workflow.duration})"
+                   " — rt-rnaseq ${params.project}: ${st.succeededCount} ok / ${st.failedCount} failed / ${st.ignoredCount} skipped (${workflow.duration})"
         def conn = new URL("${server}/${topic}").openConnection()
         conn.setRequestMethod('POST'); conn.setDoOutput(true)
         conn.setConnectTimeout(15000); conn.setReadTimeout(15000)
