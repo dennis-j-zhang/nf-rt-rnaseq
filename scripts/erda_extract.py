@@ -48,6 +48,19 @@ def http_range(url: str, start: int, nbytes: int) -> bytes:
     return r.content
 
 
+def _read_range(url: str, start: int, nbytes: int) -> bytes:
+    """Read nbytes at offset `start`: HTTP range GET for http(s) URLs, else a local-file seek — so a
+    pre-staged local subset FASTA is read with zero network (the scale-up path; ERDA can't serve ~450x)."""
+    if url.startswith(("http://", "https://")):
+        return http_range(url, start, nbytes)
+    with open(url, "rb") as f:
+        f.seek(start)
+        b = f.read(nbytes)
+    if len(b) != nbytes:
+        raise RuntimeError(f"local read: expected {nbytes} bytes at {start}, got {len(b)} from {url}")
+    return b
+
+
 def fai_rows(con, fai_url: str, id_key: str, len_key: str, ids: list[str]) -> list[dict]:
     """Fetch .fai.parquet index rows (offset + wrapping) for the requested ids."""
     con.execute("CREATE OR REPLACE TEMP TABLE want_fai(id VARCHAR)")
@@ -89,7 +102,7 @@ def _plan_chunks(recs: list[dict]) -> list[dict]:
 
 
 def _fetch_chunk(fasta_url: str, chunk: dict) -> dict:
-    buf = http_range(fasta_url, chunk["start"], chunk["end"] - chunk["start"])
+    buf = _read_range(fasta_url, chunk["start"], chunk["end"] - chunk["start"])
     out = {}
     for rec in chunk["members"]:
         s = rec["offset"] - chunk["start"]

@@ -45,6 +45,14 @@ process RUN_ACCESSION {
     export FDZ004_IGR_MIN=${params.igr_min} FDZ004_IGR_MAX=${params.igr_max} FDZ004_CLEANUP=1
     export FDZ004_MINIMAL=1   # depth over the RT-neighborhood window only; skip calmd/features/aligner-comparison
 
+    # scale-up reference cache: pull the pre-staged contig+gene SUBSET from S3 (once per task, ~12 MB) and point
+    # build_reference at it, so it NEVER reads ERDA live — the fix for ERDA HTTP timeouts at ~450x concurrency.
+    mkdir -p refcache
+    aws s3 sync ${params.refcache} refcache --only-show-errors
+    export FDZ004_GENES_CACHE=\$PWD/refcache/genes
+    export FDZ004_REF_FASTA=\$PWD/refcache/contigs.fna
+    export FDZ004_REF_FAI=\$PWD/refcache/contigs.fna.fai.parquet
+
     # steps 1-6: fetch_sra -> extract_fastq -> build_reference -> map (bowtie2 short / minimap2 long) -> postprocess -> coverage
     # cleanup frees .sra + FASTQ + raw sorted BAM after coverage; keeps reference/ + coverage/ (the light outputs)
     python /pipeline/scripts/rnaseq_pipeline.py --loci "${loci}" --only-sra ${sra} --out-dir runs

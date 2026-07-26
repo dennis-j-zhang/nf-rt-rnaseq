@@ -331,9 +331,11 @@ def build_reference(cfg: Config, sra: str, loci: list[dict], dest: Path, con) ->
     dest.mkdir(parents=True, exist_ok=True)
     contigs = sorted({r["contig_id"] for r in loci})
     ref_fasta = dest / "reference.fasta"
-    fna = f"{cfg.erda_base}/all_contigs.fna"
-    fai = f"{cfg.erda_base}/all_contigs.fna.fai.parquet"
-    gff = f"{cfg.erda_base}/all_meta_ncbi_gff.parquet"
+    # reference source: pre-staged local/S3 subset (FDZ004_REF_FASTA/FAI) if set — the scale-up path that
+    # avoids ~450 tasks hammering ERDA (see stage_refcache.py) — else read live from ERDA (pilot/low-conc).
+    fna = os.environ.get("FDZ004_REF_FASTA") or f"{cfg.erda_base}/all_contigs.fna"
+    fai = os.environ.get("FDZ004_REF_FAI") or f"{cfg.erda_base}/all_contigs.fna.fai.parquet"
+    gff = f"{cfg.erda_base}/all_meta_ncbi_gff.parquet"   # only hit if a contig's FDZ004_GENES_CACHE tsv is absent
     lengths = ee.extract_contigs(con, fna, fai, contigs, ref_fasta)
     genes_by_contig = {c: _load_genes(con, gff, c) for c in contigs}  # local cache if set (avoids ERDA contention), else ERDA
 
